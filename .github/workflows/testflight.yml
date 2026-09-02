@@ -1,0 +1,389 @@
+name: Deploy private source to TestFlight
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact 40-character private source commit
+        required: true
+        type: string
+      build_number:
+        description: App Store Connect build number, greater than every prior Evade Tracker build
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: evade-tracker-private-source-testflight
+  cancel-in-progress: false
+
+jobs:
+  archive-and-upload:
+    runs-on: xcode-27
+    timeout-minutes: 45
+    env:
+      APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+      IOS_BUNDLE_ID: ${{ vars.IOS_BUNDLE_ID }}
+      IOS_WIDGET_BUNDLE_ID: ${{ vars.IOS_WIDGET_BUNDLE_ID }}
+      WATCH_BUNDLE_ID: ${{ vars.WATCH_BUNDLE_ID }}
+      WATCH_WIDGET_BUNDLE_ID: ${{ vars.WATCH_WIDGET_BUNDLE_ID }}
+      APP_GROUP_ID: ${{ vars.APP_GROUP_ID }}
+      IOS_PROFILE_NAME: ${{ vars.IOS_PROFILE_NAME }}
+      IOS_WIDGET_PROFILE_NAME: ${{ vars.IOS_WIDGET_PROFILE_NAME }}
+      WATCH_PROFILE_NAME: ${{ vars.WATCH_PROFILE_NAME }}
+      WATCH_WIDGET_PROFILE_NAME: ${{ vars.WATCH_WIDGET_PROFILE_NAME }}
+
+    steps:
+      - name: Validate release configuration
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          BUILD_NUMBER: ${{ inputs.build_number }}
+          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          IOS_PROVISIONING_PROFILE: ${{ secrets.IOS_PROVISIONING_PROFILE }}
+          IOS_WIDGET_PROVISIONING_PROFILE: ${{ secrets.IOS_WIDGET_PROVISIONING_PROFILE }}
+          WATCH_PROVISIONING_PROFILE: ${{ secrets.WATCH_PROVISIONING_PROFILE }}
+          WATCH_WIDGET_PROVISIONING_PROFILE: ${{ secrets.WATCH_WIDGET_PROVISIONING_PROFILE }}
+          APP_STORE_CONNECT_API_KEY: ${{ secrets.APP_STORE_CONNECT_API_KEY }}
+          APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "::error::source_sha must be a full lowercase commit SHA."
+            exit 1
+          }
+          [[ "$BUILD_NUMBER" =~ ^[1-9][0-9]*$ ]] || {
+            echo "::error::build_number must be a positive integer."
+            exit 1
+          }
+          required=(
+            APPLE_TEAM_ID IOS_BUNDLE_ID IOS_WIDGET_BUNDLE_ID
+            WATCH_BUNDLE_ID WATCH_WIDGET_BUNDLE_ID APP_GROUP_ID
+            IOS_PROFILE_NAME IOS_WIDGET_PROFILE_NAME WATCH_PROFILE_NAME
+            WATCH_WIDGET_PROFILE_NAME APPLE_CERTIFICATE_P12
+            APPLE_CERTIFICATE_PASSWORD IOS_PROVISIONING_PROFILE
+            IOS_WIDGET_PROVISIONING_PROFILE WATCH_PROVISIONING_PROFILE
+            WATCH_WIDGET_PROVISIONING_PROFILE APP_STORE_CONNECT_API_KEY
+            APP_STORE_CONNECT_API_KEY_ID APP_STORE_CONNECT_ISSUER_ID
+          )
+          for name in "${required[@]}"; do
+            [[ -n "${!name:-}" ]] || {
+              echo "::error::Missing release configuration: $name"
+              exit 1
+            }
+          done
+
+      - name: Generate private source token
+        id: source-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
+        with:
+          app-id: ${{ secrets.SOURCE_APP_ID }}
+          private-key: ${{ secrets.SOURCE_APP_PRIVATE_KEY }}
+          owner: umbra-me
+          repositories: tracker-evade-fail-apple
+
+      - name: Check out exact private source revision
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: umbra-me/tracker-evade-fail-apple
+          ref: ${{ inputs.source_sha }}
+          token: ${{ steps.source-token.outputs.token }}
+          persist-credentials: false
+          path: source
+          show-progress: false
+
+      - name: Verify private source revision
+        working-directory: source
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse HEAD)" == "$SOURCE_SHA" ]]
+          test -f project.yml
+          test -f EvadeTracker/EvadeTrackerApp.swift
+          echo "Validated the requested private source revision."
+
+      - name: Validate supported Xcode
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          developer_dir="$(xcode-select -p)"
+          case "$developer_dir" in
+            *Xcode_27_beta_1.app/*|*Xcode_27_beta_2.app/*|*Xcode_27_beta_3.app/*)
+              echo "::error::App Store Connect no longer accepts this Xcode image."
+              exit 1
+              ;;
+            *Xcode_27*) ;;
+            *)
+              echo "::error::Expected an Xcode 27 runner."
+              exit 1
+              ;;
+          esac
+
+      - name: Install pinned XcodeGen
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --silent --show-error \
+            --output "$RUNNER_TEMP/xcodegen.zip" \
+            https://github.com/yonaskolb/XcodeGen/releases/download/2.45.4/xcodegen.zip
+          echo "090ec29491aad50aec10631bf6e62253fed733c50f3aab0f5ffc86bc170bdbef  $RUNNER_TEMP/xcodegen.zip" \
+            | shasum -a 256 --check
+          unzip -q "$RUNNER_TEMP/xcodegen.zip" -d "$RUNNER_TEMP"
+          sudo "$RUNNER_TEMP/xcodegen/install.sh"
+
+      - name: Install and validate signing assets
+        env:
+          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          IOS_PROVISIONING_PROFILE: ${{ secrets.IOS_PROVISIONING_PROFILE }}
+          IOS_WIDGET_PROVISIONING_PROFILE: ${{ secrets.IOS_WIDGET_PROVISIONING_PROFILE }}
+          WATCH_PROVISIONING_PROFILE: ${{ secrets.WATCH_PROVISIONING_PROFILE }}
+          WATCH_WIDGET_PROVISIONING_PROFILE: ${{ secrets.WATCH_WIDGET_PROVISIONING_PROFILE }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          certificate_path="$RUNNER_TEMP/apple-distribution.p12"
+          keychain_path="$RUNNER_TEMP/evade-tracker-signing.keychain-db"
+          keychain_password="$(uuidgen)"
+          profiles_path="$HOME/Library/MobileDevice/Provisioning Profiles"
+
+          printf '%s' "$APPLE_CERTIFICATE_P12" | base64 -D > "$certificate_path"
+          mkdir -p "$profiles_path"
+
+          validate_profile() {
+            local encoded="$1" bundle_id="$2" expected_name="$3" stem="$4"
+            local profile="$RUNNER_TEMP/$stem.mobileprovision"
+            local plist="$RUNNER_TEMP/$stem.plist"
+            printf '%s' "$encoded" | base64 -D > "$profile"
+            security cms -D -i "$profile" > "$plist"
+            ! /usr/libexec/PlistBuddy -c 'Print :ProvisionedDevices' "$plist" >/dev/null 2>&1
+            local uuid name app_id get_task_allow expiration app_group
+            uuid="$(/usr/libexec/PlistBuddy -c 'Print :UUID' "$plist")"
+            name="$(/usr/libexec/PlistBuddy -c 'Print :Name' "$plist")"
+            app_id="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$plist")"
+            get_task_allow="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:get-task-allow' "$plist")"
+            expiration="$(/usr/libexec/PlistBuddy -c 'Print :ExpirationDate' "$plist")"
+            app_group="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:com.apple.security.application-groups:0' "$plist")"
+            [[ "$name" == "$expected_name" ]]
+            [[ "$app_id" == "$APPLE_TEAM_ID.$bundle_id" ]]
+            [[ "$get_task_allow" == "false" ]]
+            [[ "$app_group" == "$APP_GROUP_ID" ]]
+            [[ "$(date -j -f '%a %b %d %T %Z %Y' "$expiration" '+%s')" -gt "$(date '+%s')" ]]
+            cp "$profile" "$profiles_path/$uuid.mobileprovision"
+          }
+
+          validate_profile "$IOS_PROVISIONING_PROFILE" "$IOS_BUNDLE_ID" "$IOS_PROFILE_NAME" ios
+          validate_profile "$IOS_WIDGET_PROVISIONING_PROFILE" "$IOS_WIDGET_BUNDLE_ID" "$IOS_WIDGET_PROFILE_NAME" ios-widget
+          validate_profile "$WATCH_PROVISIONING_PROFILE" "$WATCH_BUNDLE_ID" "$WATCH_PROFILE_NAME" watch
+          validate_profile "$WATCH_WIDGET_PROVISIONING_PROFILE" "$WATCH_WIDGET_BUNDLE_ID" "$WATCH_WIDGET_PROFILE_NAME" watch-widget
+
+          security create-keychain -p "$keychain_password" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$keychain_password" "$keychain_path"
+          security import "$certificate_path" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -A -t cert -f pkcs12 -k "$keychain_path"
+          security set-key-partition-list \
+            -S apple-tool:,apple: \
+            -k "$keychain_password" \
+            "$keychain_path" >/dev/null
+          security list-keychains -d user -s "$keychain_path"
+          security find-identity -v -p codesigning "$keychain_path" \
+            | grep -q '1 valid identities found'
+
+      - name: Generate Xcode project
+        working-directory: source
+        shell: bash
+        run: xcodegen generate >/dev/null
+
+      - name: Archive signed app
+        id: archive
+        continue-on-error: true
+        working-directory: source
+        env:
+          BUILD_NUMBER: ${{ inputs.build_number }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive_log="$RUNNER_TEMP/evade-tracker-archive.log"
+          if ! xcodebuild \
+            -project EvadeTrackerApple.xcodeproj \
+            -scheme EvadeTracker \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/EvadeTracker.xcarchive" \
+            CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY="Apple Distribution" \
+            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
+            clean archive >"$archive_log" 2>&1; then
+            echo "::error::The private source archive failed. Diagnostics are intentionally suppressed."
+            exit 1
+          fi
+          echo "Signed archive created."
+
+      - name: Verify signed archive
+        if: steps.archive.outcome == 'success'
+        env:
+          BUILD_NUMBER: ${{ inputs.build_number }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          app="$RUNNER_TEMP/EvadeTracker.xcarchive/Products/Applications/EvadeTracker.app"
+          test -d "$app"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Info.plist")" = "$IOS_BUNDLE_ID"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app/Info.plist")" = "$BUILD_NUMBER"
+          codesign --verify --deep --strict "$app"
+
+          verify_embedded_profile() {
+            local product="$1" expected_id="$2" stem="$3"
+            local plist="$RUNNER_TEMP/$stem-embedded-profile.plist"
+            security cms -D -i "$product/embedded.mobileprovision" > "$plist"
+            test "$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$plist")" = "$APPLE_TEAM_ID.$expected_id"
+            test "$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:com.apple.security.application-groups:0' "$plist")" = "$APP_GROUP_ID"
+          }
+
+          verify_embedded_profile "$app" "$IOS_BUNDLE_ID" app
+          widget="$app/PlugIns/EvadeTrackerWidgets.appex"
+          test -d "$widget"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$widget/Info.plist")" = "$IOS_WIDGET_BUNDLE_ID"
+          codesign --verify --strict "$widget"
+          verify_embedded_profile "$widget" "$IOS_WIDGET_BUNDLE_ID" widget
+
+          watch_app="$app/Watch/EvadeTrackerWatch.app"
+          test -d "$watch_app"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$watch_app/Info.plist")" = "$WATCH_BUNDLE_ID"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$watch_app/Info.plist")" = "$BUILD_NUMBER"
+          codesign --verify --deep --strict "$watch_app"
+          verify_embedded_profile "$watch_app" "$WATCH_BUNDLE_ID" watch
+
+          watch_widget="$watch_app/PlugIns/EvadeTrackerWatchWidgets.appex"
+          test -d "$watch_widget"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$watch_widget/Info.plist")" = "$WATCH_WIDGET_BUNDLE_ID"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$watch_widget/Info.plist")" = "$BUILD_NUMBER"
+          codesign --verify --strict "$watch_widget"
+          verify_embedded_profile "$watch_widget" "$WATCH_WIDGET_BUNDLE_ID" watch-widget
+          echo "Signed archive identity verified."
+
+      - name: Export signed IPA
+        if: steps.archive.outcome == 'success'
+        id: export
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          export_options="$RUNNER_TEMP/ExportOptions.plist"
+          cat > "$export_options" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>destination</key><string>export</string>
+            <key>manageAppVersionAndBuildNumber</key><false/>
+            <key>method</key><string>app-store-connect</string>
+            <key>provisioningProfiles</key>
+            <dict>
+              <key>${IOS_BUNDLE_ID}</key><string>${IOS_PROFILE_NAME}</string>
+              <key>${IOS_WIDGET_BUNDLE_ID}</key><string>${IOS_WIDGET_PROFILE_NAME}</string>
+              <key>${WATCH_BUNDLE_ID}</key><string>${WATCH_PROFILE_NAME}</string>
+              <key>${WATCH_WIDGET_BUNDLE_ID}</key><string>${WATCH_WIDGET_PROFILE_NAME}</string>
+            </dict>
+            <key>signingStyle</key><string>manual</string>
+            <key>stripSwiftSymbols</key><true/>
+            <key>teamID</key><string>${APPLE_TEAM_ID}</string>
+            <key>uploadSymbols</key><true/>
+          </dict>
+          </plist>
+          PLIST
+          export_log="$RUNNER_TEMP/evade-tracker-export.log"
+          if ! xcodebuild \
+            -exportArchive \
+            -archivePath "$RUNNER_TEMP/EvadeTracker.xcarchive" \
+            -exportPath "$RUNNER_TEMP/export" \
+            -exportOptionsPlist "$export_options" >"$export_log" 2>&1; then
+            echo "::error::IPA export failed. Diagnostics are intentionally suppressed."
+            exit 1
+          fi
+
+      - name: Encrypt private release diagnostics
+        if: steps.archive.outcome == 'failure' || steps.export.outcome == 'failure'
+        env:
+          DIAGNOSTIC_PUBLIC_KEY: ${{ secrets.DIAGNOSTIC_PUBLIC_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          diagnostic_log="$RUNNER_TEMP/private-release.log"
+          : > "$diagnostic_log"
+          for log in "$RUNNER_TEMP/evade-tracker-archive.log" "$RUNNER_TEMP/evade-tracker-export.log"; do
+            if [[ -f "$log" ]]; then
+              cat "$log" >> "$diagnostic_log"
+            fi
+          done
+          printf '%s' "$DIAGNOSTIC_PUBLIC_KEY" > "$RUNNER_TEMP/diagnostic-public.pem"
+          openssl rand -hex 32 > "$RUNNER_TEMP/diagnostic-key.hex"
+          openssl enc -aes-256-cbc -salt -pbkdf2 \
+            -in "$diagnostic_log" \
+            -out "$RUNNER_TEMP/private-release.log.enc" \
+            -pass file:"$RUNNER_TEMP/diagnostic-key.hex"
+          openssl pkeyutl -encrypt -pubin \
+            -inkey "$RUNNER_TEMP/diagnostic-public.pem" \
+            -in "$RUNNER_TEMP/diagnostic-key.hex" \
+            -out "$RUNNER_TEMP/diagnostic-key.enc" \
+            -pkeyopt rsa_padding_mode:oaep \
+            -pkeyopt rsa_oaep_md:sha256
+          rm -f "$RUNNER_TEMP/diagnostic-key.hex" \
+            "$RUNNER_TEMP/diagnostic-public.pem" "$diagnostic_log"
+
+      - name: Upload encrypted release diagnostics
+        if: steps.archive.outcome == 'failure' || steps.export.outcome == 'failure'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: encrypted-private-release-diagnostics
+          path: |
+            ${{ runner.temp }}/private-release.log.enc
+            ${{ runner.temp }}/diagnostic-key.enc
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Report private release failure
+        if: steps.archive.outcome == 'failure' || steps.export.outcome == 'failure'
+        run: exit 1
+
+      - name: Upload to App Store Connect
+        if: steps.archive.outcome == 'success' && steps.export.outcome == 'success'
+        env:
+          APP_STORE_CONNECT_API_KEY: ${{ secrets.APP_STORE_CONNECT_API_KEY }}
+          APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          private_keys_path="$HOME/.appstoreconnect/private_keys"
+          auth_key_path="$private_keys_path/AuthKey_${APP_STORE_CONNECT_API_KEY_ID}.p8"
+          ipa_path="$(find "$RUNNER_TEMP/export" -maxdepth 1 -type f -name '*.ipa' -print -quit)"
+          test -n "$ipa_path"
+          mkdir -p "$private_keys_path"
+          printf '%s' "$APP_STORE_CONNECT_API_KEY" > "$auth_key_path"
+          chmod 600 "$auth_key_path"
+          xcrun altool \
+            --upload-app \
+            --type ios \
+            --file "$ipa_path" \
+            --apiKey "$APP_STORE_CONNECT_API_KEY_ID" \
+            --apiIssuer "$APP_STORE_CONNECT_ISSUER_ID"
+
+      - name: Remove temporary credentials
+        if: always()
+        env:
+          APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+        shell: bash
+        run: |
+          security delete-keychain "$RUNNER_TEMP/evade-tracker-signing.keychain-db" >/dev/null 2>&1 || true
+          rm -f "$HOME/.appstoreconnect/private_keys/AuthKey_${APP_STORE_CONNECT_API_KEY_ID}.p8"

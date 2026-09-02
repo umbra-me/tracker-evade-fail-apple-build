@@ -1,0 +1,8 @@
+.DS_Store
+*.log
+*.xcresult
+*.xcarchive
+*.ipa
+*.p8
+*.p12
+*.mobileprovision
