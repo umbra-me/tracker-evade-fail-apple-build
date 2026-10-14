@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "component": "evade/tracker-apple-build",
+  "hosts": [
+    "macos",
+    "linux",
+    "windows"
+  ],
+  "tools": [
+    {
+      "executable": "python3",
+      "version": ">=3.9"
+    }
+  ],
+  "actions": {
+    "check": [
+      {
+        "executable": "python3",
+        "arguments": [
+          "tools/check-public-boundary.py"
+        ],
+        "cwd": "."
+      }
+    ],
+    "build": [
+      {
+        "executable": "python3",
+        "arguments": [
+          "tools/check-public-boundary.py"
+        ],
+        "cwd": "."
+      }
+    ]
+  },
+  "manual_gates": [
+    "public orchestration only; never publish private application source or logs",
+    "signed/TestFlight/CI credential provisioning remain separately gated"
+  ]
+}
